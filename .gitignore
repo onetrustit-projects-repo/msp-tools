@@ -1,0 +1,18 @@
+# Data & logs (never commit)
+data/clients.db
+data/reports/
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*.swo
+.idea/
+.vscode/
