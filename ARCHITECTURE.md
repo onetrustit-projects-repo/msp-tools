@@ -1,987 +1,679 @@
-# MSP Tools Platform — Architecture Document
+# MSP Tools — System Architecture
 
-## Table of Contents
-1. [System Overview](#1-system-overview)
-2. [Technology Stack](#2-technology-stack)
-3. [Database Architecture](#3-database-architecture)
-4. [API Architecture](#4-api-architecture)
-5. [Agent Communication Protocol](#5-agent-communication-protocol)
-6. [WebSocket Architecture](#6-websocket-architecture)
-7. [Security Architecture](#7-security-architecture)
-8. [Deployment Architecture](#8-deployment-architecture)
-9. [Directory Structure Detail](#9-directory-structure-detail)
+## Overview
+
+This document describes the internal architecture of the MSP Tools RMM/PSA platform, with focus on the Go-based server and agent components. It covers data flow, concurrency models, deployment topology, and key design decisions.
 
 ---
 
-## 1. System Overview
-
-### 1.1 Platform Purpose
-
-The MSP Tools Platform is a self-hosted Remote Monitoring & Management (RMM) and Professional Services Automation (PSA) system designed for small-to-medium Managed Service Providers (MSPs). It provides complete infrastructure visibility, ticketing, time tracking, billing, and automation capabilities without any external cloud dependencies.
-
-### 1.2 System Boundaries
+## System Layers
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      Internet / WAN                          │
-└───────────────────────────┬─────────────────────────────────┘
-                            │ (optional, for remote agents)
-┌───────────────────────────▼─────────────────────────────────┐
-│                                                             │
-│   ┌──────────────────────────────────────────────────────┐ │
-│   │              DMZ / Perimeter Network                  │ │
-│   │   (optional reverse proxy, TLS termination)           │ │
-│   └──────────────────────────────────────────────────────┘ │
-│                            │                                 │
-│   ┌────────────────────────▼────────────────────────────────▼─┐
-│   │                                                          │ │
-│   │  ┌─────────────────┐  ┌─────────────────────────────┐  │ │
-│   │  │   MSP Server    │  │      SQLite Database        │  │ │
-│   │  │  (FastAPI + WS) │◄─┤   (/opt/msp-tools/data/)    │  │ │
-│   │  │  Port 8443/8443  │  └─────────────────────────────┘  │ │
-│   │  └────────┬────────┘                                     │ │
-│   │           │                                              │ │
-│   │  ┌────────▼────────┐  ┌─────────────────────────────┐  │ │
-│   │  │   Web UI        │  │    File Storage             │  │ │
-│   │  │   Port 8080    │  │  /opt/msp-tools/data/files/ │  │ │
-│   │  └─────────────────┘  │  /opt/msp-tools/logs/       │  │ │
-│   │                      └─────────────────────────────┘  │ │
-│   │                                                          │ │
-│   └──────────────────────────────────────────────────────────┘
-│                            │
-         LAN / VPN           │
-┌────────┬────────┬──────────┴──────┬─────────────┬────────────┐
-│        │        │                 │             │            │
-│  ┌─────▼──┐ ┌───▼───┐       ┌────▼────┐ ┌──────▼─────┐ ┌───▼────┐
-│  │ Linux  │ │Windows│       │ macOS   │ │  Network   │ │  VoIP  │
-│  │ Agent  │ │ Agent │       │ Agent   │ │  Devices   │ │ Gateway│
-│  │port 443│ │ port  │       │ port 443│ │  (SNMP)   │ │(SNMP)  │
-│  └────────┘ └───────┘       └─────────┘ └────────────┘ └────────┘
-```
-
-### 1.3 Component Responsibilities
-
-| Component | Responsibility |
-|-----------|----------------|
-| FastAPI Server | REST API, WebSocket handling, business logic, scheduling |
-| SQLite Database | All persistent data (clients, endpoints, tickets, time, config) |
-| File Storage | Uploaded attachments, generated PDFs, agent scripts, logs |
-| Web UI | Browser-based admin interface (served by Flask/FastAPI) |
-| Agent Service | Per-endpoint daemon: collects data, runs checks, reports to server |
-| CLI Tools | Technician command-line operations |
-| Customer Portal | End-customer ticket view/submission |
-
----
-
-## 2. Technology Stack
-
-### 2.1 Core Server
-
-| Layer | Technology | Version | Purpose |
-|-------|------------|---------|---------|
-| Runtime | Python | 3.9+ | Primary language |
-| Web Framework | FastAPI | 0.109+ | REST API, WebSocket |
-| ASGI Server | uvicorn | 0.27+ | ASGI server with workers |
-| ORM | SQLAlchemy | 2.0+ | Database abstraction |
-| Database | SQLite | 3.x | Data storage |
-| Validation | Pydantic | 2.0+ | Data models, settings |
-| Auth | python-jose | 3.3+ | JWT handling |
-| Passwords | passlib + bcrypt | 1.7+ | Password hashing |
-| Task Scheduler | APScheduler | 3.10+ | Cron-like scheduling |
-| PDF Generation | reportlab | 4.0+ | Invoice/report PDFs |
-| Logging | structlog | 24.0+ | Structured JSON logging |
-| Config | PyYAML | 6.0+ | YAML configuration |
-
-### 2.2 Agent Runtime
-
-| OS | Language | Runtime |
-|----|----------|---------|
-| Linux | Python 3 | System Python3, requires 3.8+ |
-| Windows | Python 3 or Go | Embedded Python or standalone Go binary |
-| macOS | Python 3 | System Python3 |
-
-### 2.3 Web UI
-
-| Layer | Technology |
-|-------|------------|
-| Framework | FastAPI (serving Jinja2 templates) or Flask |
-| Templates | Jinja2 HTML |
-| CSS | Vanilla CSS (no framework dependency) or minimal Tailwind |
-| JavaScript | Vanilla JS (no heavy framework) |
-| Icons | Inline SVG or Font Awesome (self-hosted) |
-| Charts | Chart.js (self-hosted) |
-
----
-
-## 3. Database Architecture
-
-### 3.1 Schema Overview (Entity Relationship)
-
-```
-┌──────────────┐       ┌──────────────────┐       ┌──────────────┐
-│    users     │       │      clients      │       │  endpoints   │
-├──────────────┤       ├──────────────────┤       ├──────────────┤
-│ id (PK)      │       │ id (PK)          │       │ id (PK)      │
-│ username     │       │ name             │       │ client_id(FK)│
-│ email        │       │ contact_*        │       │ hostname     │
-│ password_hash│       │ health_score     │       │ os_*         │
-│ role         │       │ tags             │       │ last_seen    │
-│ is_active    │       └────────┬─────────┘       │ agent_status │
-└──────────────┘                │                 └───────┬──────┘
-       │                        │                         │
-       │                        │ 1:N                     │ 1:N
-       │                        ▼                         ▼
-       │               ┌──────────────────┐       ┌──────────────┐
-       │               │    contracts     │       │    checks    │
-       │               ├──────────────────┤       ├──────────────┤
-       │               │ id (PK)          │       │ id (PK)      │
-       │               │ client_id (FK)   │       │ endpoint_id  │
-       │               │ monthly_value    │       │ check_type   │
-       │               │ end_date         │       │ interval_sec │
-       │               └──────────────────┘       └──────┬───────┘
-       │                                                   │
-       │                        ┌─────────────────────────┘
-       │                        │ 1:N
-       │                        ▼
-       │               ┌──────────────────┐       ┌──────────────┐
-       │               │    alerts        │       │   assets     │
-       │               ├──────────────────┤       ├──────────────┤
-       │               │ id (PK)          │       │ id (PK)      │
-       │               │ endpoint_id (FK) │       │ endpoint_id  │
-       │               │ check_id (FK)    │       │ asset_type   │
-       │               │ status           │       │ name         │
-       │               └──────────────────┘       │ version      │
-       │                                           └──────────────┘
-       │
-       │
-┌──────▼──────────────────┐       ┌──────────────────┐
-│        tickets          │       │    projects      │
-├─────────────────────────┤       ├──────────────────┤
-│ id (PK)                 │       │ id (PK)          │
-│ ticket_number           │       │ client_id (FK)   │
-│ client_id (FK)          │       │ name             │
-│ endpoint_id (FK)        │       │ status           │
-│ title                   │       │ start_date       │
-│ status                  │       │ end_date         │
-│ priority                │       └────────┬─────────┘
-│ assigned_to (FK→users)  │                │ 1:N
-│ sla_*                   │                ▼
-│ billed_minutes          │       ┌──────────────────┐
-└───────────┬─────────────┘       │  project_tasks   │
-            │                     ├──────────────────┤
-            │ 1:N                 │ id (PK)          │
-            ▼                     │ project_id (FK)  │
-┌───────────────────────────┐    │ title            │
-│     ticket_comments       │    │ status           │
-├───────────────────────────┤    │ assigned_to(FK) │
-│ id (PK)                   │    └──────────────────┘
-│ ticket_id (FK)            │
-│ user_id (FK)              │    ┌──────────────────┐
-│ content                   │    │  time_entries    │
-│ is_internal               │    ├──────────────────┤
-└───────────────────────────┘    │ id (PK)          │
-                                 │ user_id (FK)     │
-┌───────────────────────────┐    │ client_id (FK)   │
-│     time_entries          │    │ ticket_id (FK)   │
-├───────────────────────────┤    │ project_id (FK)  │
-│ id (PK)                  │    │ start_time       │
-│ user_id (FK)             │    │ end_time         │
-│ client_id (FK)           │    │ billable         │
-│ ticket_id (FK)           │    └──────────────────┘
-│ description               │
-│ start_time                │
-│ duration_minutes          │    ┌──────────────────┐
-└───────────────────────────┘    │    invoices      │
-                                 ├──────────────────┤
-┌───────────────────────────┐    │ id (PK)          │
-│     kb_articles           │    │ invoice_number   │
-├───────────────────────────┤    │ client_id (FK)   │
-│ id (PK)                   │    │ status           │
-│ title                     │    │ total            │
-│ slug                      │    │ issue_date       │
-│ content                   │    │ due_date         │
-│ category                  │    └────────┬─────────┘
-│ views                     │             │ 1:N
-└───────────────────────────┘             ▼
-                                 ┌──────────────────────┐
-┌───────────────────────────┐    │  invoice_line_items  │
-│        runbooks           │    ├──────────────────────┤
-├───────────────────────────┤    │ id (PK)             │
-│ id (PK)                   │    │ invoice_id (FK)     │
-│ name                      │    │ description         │
-│ trigger_type              │    │ quantity            │
-│ steps (JSON)              │    │ unit_price          │
-│ enabled                   │    │ total               │
-└───────────────────────────┘    │ time_entry_id (FK)  │
-                                 └──────────────────────┘
-
-┌───────────────────────────┐
-│     automation_events     │
-├───────────────────────────┤
-│ id (PK)                   │
-│ event_type                │
-│ source_type               │
-│ source_id                 │
-│ payload (JSON)            │
-│ handled                   │
-└───────────────────────────┘
-
-┌───────────────────────────┐
-│       audit_log           │
-├───────────────────────────┤
-│ id (PK)                   │
-│ user_id (FK)              │
-│ action                    │
-│ entity_type               │
-│ entity_id                 │
-│ details (JSON)            │
-│ ip_address                │
-│ created_at                │
-└───────────────────────────┘
-```
-
-### 3.2 Indexes
-
-```sql
--- Performance indexes
-CREATE INDEX idx_endpoints_client_id ON endpoints(client_id);
-CREATE INDEX idx_endpoints_hostname ON endpoints(hostname);
-CREATE INDEX idx_endpoints_last_seen ON endpoints(last_seen);
-CREATE INDEX idx_checks_endpoint_id ON checks(endpoint_id);
-CREATE INDEX idx_check_results_check_id ON check_results(check_id);
-CREATE INDEX idx_check_results_executed_at ON check_results(executed_at);
-CREATE INDEX idx_alerts_endpoint_id ON alerts(endpoint_id);
-CREATE INDEX idx_alerts_status ON alerts(status);
-CREATE INDEX idx_alerts_created_at ON alerts(created_at);
-CREATE INDEX idx_tickets_client_id ON tickets(client_id);
-CREATE INDEX idx_tickets_status ON tickets(status);
-CREATE INDEX idx_tickets_assigned_to ON tickets(assigned_to);
-CREATE INDEX idx_tickets_sla_response_due ON tickets(sla_response_due);
-CREATE INDEX idx_tickets_sla_resolution_due ON tickets(sla_resolution_due);
-CREATE INDEX idx_ticket_comments_ticket_id ON ticket_comments(ticket_id);
-CREATE INDEX idx_time_entries_user_id ON time_entries(user_id);
-CREATE INDEX idx_time_entries_client_id ON time_entries(client_id);
-CREATE INDEX idx_time_entries_ticket_id ON time_entries(ticket_id);
-CREATE INDEX idx_time_entries_billed ON time_entries(billed);
-CREATE INDEX idx_invoice_line_items_invoice_id ON invoice_line_items(invoice_id);
-CREATE INDEX idx_audit_log_user_id ON audit_log(user_id);
-CREATE INDEX idx_audit_log_created_at ON audit_log(created_at);
+┌──────────────────────────────────────────────────────────┐
+│                    Presentation Layer                     │
+│         (Web UI — React SPA + Technician CLI)            │
+└───────────────────────┬──────────────────────────────────┘
+                        │ HTTPS / WSS
+┌───────────────────────▼──────────────────────────────────┐
+│                    API Layer (Gin)                       │
+│  Middleware: ID → Log → Recover → RateLimit → Auth → CORS│
+│  Routes: /api/* (REST) + /ws/* (WebSocket)               │
+└───────────────────────┬──────────────────────────────────┘
+                        │
+┌───────────────────────▼──────────────────────────────────┐
+│                   Service Layer                          │
+│  AgentService | MonitoringService | AlertingService     │
+│  TicketService | BillingService                          │
+└───────────────────────┬──────────────────────────────────┘
+                        │
+┌───────────────────────▼──────────────────────────────────┐
+│                   Data Layer                             │
+│  Repository pattern (interfaces + SQLite/PostgreSQL)     │
+└───────────────────────┬──────────────────────────────────┘
+                        │
+┌───────────────────────▼──────────────────────────────────┐
+│                   Storage                                │
+│           SQLite (dev) / PostgreSQL (prod)              │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 4. API Architecture
+## Server Architecture (`server/`)
 
-### 4.1 API Versioning Strategy
+### Concurrency Model
 
-- Base path: `/api/v1/`
-- Version in URL path (not headers) for simplicity
-- Breaking changes increment version (v2, v3)
-- Old versions supported for minimum 6 months after new release
+Go's goroutine-per-connection handles agent connections efficiently. Each WebSocket connection spawns a single goroutine that reads messages, processes them, and writes responses. Goroutines are lightweight (2 KB initial stack, grows on demand), and the Go scheduler handles multiplexing onto OS threads (GOMAXPROCS = number of CPU cores by default).
 
-### 4.2 Endpoint Summary
+**Key goroutine sources:**
+- HTTP request handlers (one goroutine per request; Gin pools them)
+- WebSocket connections (one goroutine per agent + terminal session)
+- Scheduled check execution (via `cron` or in-process ticker)
+- Alert evaluation (triggered on new check results)
+- Background cleanup (dead connection removal, metric retention)
 
-| Category | Endpoints | Methods |
-|----------|-----------|---------|
-| Auth | `/auth/login`, `/auth/logout`, `/auth/refresh` | POST |
-| Clients | `/clients`, `/clients/{id}`, `/clients/{id}/endpoints` | GET, POST, PUT, DELETE |
-| Endpoints | `/endpoints`, `/endpoints/{id}`, `/endpoints/{id}/checks`, `/endpoints/{id}/assets` | GET, POST, PUT, DELETE |
-| Checks | `/checks`, `/checks/{id}`, `/checks/{id}/results`, `/checks/{id}/run` | GET, POST, PUT, DELETE |
-| Alerts | `/alerts`, `/alerts/{id}`, `/alerts/{id}/acknowledge` | GET, POST, PUT |
-| Tickets | `/tickets`, `/tickets/{id}`, `/tickets/{id}/comments`, `/tickets/{id}/attachments` | GET, POST, PUT, DELETE |
-| Time | `/time-entries`, `/time-entries/{id}`, `/time-entries/timer/*` | GET, POST, PUT, DELETE |
-| KB | `/kb`, `/kb/{id}`, `/kb/{slug}` | GET, POST, PUT, DELETE |
-| Projects | `/projects`, `/projects/{id}`, `/projects/{id}/tasks` | GET, POST, PUT, DELETE |
-| Contracts | `/contracts`, `/contracts/{id}` | GET, POST, PUT, DELETE |
-| Invoices | `/invoices`, `/invoices/{id}`, `/invoices/{id}/pdf` | GET, POST, PUT |
-| Runbooks | `/runbooks`, `/runbooks/{id}`, `/runbooks/{id}/execute` | GET, POST, PUT, DELETE |
-| Reports | `/reports/health`, `/reports/sla`, `/reports/technician`, `/reports/monthly` | GET, POST |
-| Agents | `/agents/register`, `/agents/{id}/heartbeat`, `/agents/{id}/results`, `/agents/{id}/command` | GET, POST |
-| Users | `/users`, `/users/{id}`, `/users/{id}/password` | GET, POST, PUT, DELETE |
+**Memory footprint estimate:**
+- 1000 agents connected: ~50–100 MB total (vs. 1–2 GB with Python + async frameworks)
+- Each agent goroutine: ~5–10 KB stack + WebSocket buffer overhead
 
-### 4.3 Request/Response Patterns
+### WebSocket Hub (`server/ws/hub.go`)
 
-**Create (POST /api/v1/clients):**
-```json
-// Request
-{
-  "name": "Acme Corporation",
-  "contact_name": "John Smith",
-  "contact_email": "john@acme.com",
-  "contact_phone": "+1-555-0100",
-  "tags": ["enterprise", "priority"]
-}
+The hub is the central dispatcher for all WebSocket connections.
 
-// Response (201 Created)
-{
-  "data": {
-    "id": 1,
-    "name": "Acme Corporation",
-    "contact_name": "John Smith",
-    "contact_email": "john@acme.com",
-    "contact_phone": "+1-555-0100",
-    "tags": ["enterprise", "priority"],
-    "health_score": null,
-    "created_at": "2024-01-15T10:30:00Z",
-    "updated_at": "2024-01-15T10:30:00Z"
-  }
+```
+Hub
+ ├── clients: map[*Client]bool   (registered connections)
+ ├── groups:  map[string][]*Client (e.g. "client:42" → all endpoints for client 42)
+ ├── register:   chan *Client
+ ├── unregister:  chan *Client
+ ├── broadcast:   chan []byte
+ └── mutex (protects maps during concurrent modification)
+```
+
+**Client struct (per connection):**
+```go
+type Client struct {
+    hub      *Hub
+    conn     *websocket.Conn
+    send     chan []byte      // buffered channel for outgoing messages
+    endpoint *Endpoint        // nil for terminal sessions
+    user     *User            // nil for agent connections
+    isAgent  bool
 }
 ```
 
-**Update (PUT /api/v1/clients/{id}):**
-```json
-// Request
-{
-  "contact_email": "newcontact@acme.com"
+**Message flow:**
+1. Client connects → `hub.register` → client added to `clients` map and relevant `groups`
+2. Incoming message → goroutine reads from WebSocket → parsed → routed to handler
+3. Outgoing message → goroutine sends to `client.send` channel → WebSocket write
+4. Disconnect → `hub.unregister` → cleanup (remove from groups, close send channel)
+
+**Heartbeat:** Hub pings all clients every 30s. Clients must pong within 30s or are disconnected.
+
+### Request Lifecycle
+
+```
+HTTP Request
+    │
+    ▼
+Gin Middleware Chain
+    ├── RequestID    — attach UUID to context
+    ├── Logger       — structured log (start time → duration → status)
+    ├── Recoverer    — catch panics → 500 + stack
+    ├── RateLimit    — token bucket (100/min IP, 1000/min JWT)
+    ├── Auth         — JWT validation → inject user into context
+    ├── CORS         — set Access-Control-* headers
+    └── RBAC         — check role permissions (if route requires specific role)
+    │
+    ▼
+Handler
+    │
+    ▼
+Service (business logic)
+    │
+    ▼
+Repository (database)
+    │
+    ▼
+Response (JSON) + Audit Log entry written asynchronously
+```
+
+### Database Migrations (`server/db/migrate.go`)
+
+Migrations are versioned SQL files applied sequentially on startup.
+
+```
+schema_migrations table:
+  version | applied_at
+  1       | 2024-01-15 10:00:00Z
+  2       | 2024-01-20 14:30:00Z
+```
+
+Migration files live in `server/db/migrations/` and are applied in order. Rollback is not supported (restore from backup instead).
+
+### Repository Pattern
+
+Each domain entity has a repository interface and a concrete implementation:
+
+```go
+type ClientRepository interface {
+    Create(ctx context.Context, c *Client) error
+    GetByID(ctx context.Context, id int64) (*Client, error)
+    List(ctx context.Context, f ClientFilter) ([]*Client, error)
+    Update(ctx context.Context, c *Client) error
+    Delete(ctx context.Context, id int64) error
 }
 
-// Response (200 OK)
-{
-  "data": { /* full updated object */ }
+type SQLiteClientRepository struct {
+    db *sql.DB
 }
 ```
 
-**List with Filter (GET /api/v1/tickets?status=open&priority=high&assigned_to=3):**
-```json
-// Response (200 OK)
-{
-  "data": [
-    { /* ticket 1 */ },
-    { /* ticket 2 */ }
-  ],
-  "pagination": {
-    "page": 1,
-    "per_page": 20,
-    "total_items": 47,
-    "total_pages": 3,
-    "has_next": true,
-    "has_prev": false
-  }
-}
-```
-
-### 4.4 API Rate Limiting
-
-- Default: 100 requests/minute per user
-- Burst: 20 requests/second
-- Agent endpoints: 1000 requests/minute per agent
-- Return `429 Too Many Requests` when exceeded with `Retry-After` header
+This keeps service layer independent of the database driver, making it straightforward to swap SQLite for PostgreSQL without changing business logic.
 
 ---
 
-## 5. Agent Communication Protocol
+## Agent Architecture (`agent/`)
 
-### 5.1 Connection Lifecycle
+### Agent Binary
 
-```
-Agent                              Server
-  │                                    │
-  │────────── TCP TLS Connect ────────▶│
-  │                                    │
-  │◀──── Server TLS Certificate ──────│
-  │                                    │
-  │────── Agent Hello + TLS Client ───▶│
-  │     Certificate                    │
-  │                                    │
-  │◀──── Server Challenge ─────────────│
-  │                                    │
-  │────── Challenge Response ──────────▶│
-  │     (signed with agent key)        │
-  │                                    │
-  │◀──── Access Token Granted ─────────│
-  │     (JWT, short-lived)             │
-  │                                    │
-  │======= WebSocket Channel =========▶│
-  │     (bidirectional JSON messages)   │
-  │                                    │
-  │  ... bidirectional messages ...    │
-  │                                    │
-  │◀──── Server: close / reconnect ────│
-  │     (normal shutdown or error)     │
-  │                                    │
-  │======= Connection Closed =========│
-```
+The agent is a **statically compiled Go binary** with no external runtime dependencies. It is embedded in the server binary and streamed to endpoints on first deployment.
 
-### 5.2 WebSocket Message Protocol
+**Agent responsibilities:**
+1. Maintain persistent WebSocket connection to server
+2. Send heartbeat with system metrics every 30s
+3. Receive and execute scripts (PowerShell on Windows, Bash on Linux/macOS)
+4. Run scheduled checks locally (disk, SSL, uptime — Python scripts invoked as subprocess)
+5. Auto-update when server pushes a new version
 
-All messages are JSON with a common envelope:
-
-```json
-{
-  "id": "msg-uuid-001",
-  "type": "message_type",
-  "timestamp": "2024-01-15T10:30:00.123Z",
-  "payload": { ... }
-}
-```
-
-**Type Catalog:**
-
-| Direction | Type | Description |
-|-----------|------|-------------|
-| S→A | `check_config` | Push new/modified check configuration to agent |
-| S→A | `script_execute` | Request agent run a specific script |
-| S→A | `file_push` | Push a file/script content to agent |
-| S→A | `agent_update` | Request agent self-update |
-| S→A | `agent_config_update` | Update agent settings |
-| S→A | `ping` | Server heartbeat request |
-| A→S | `check_result` | Agent reports check execution result |
-| A→S | `script_output` | Agent returns script execution output |
-| A→S | `heartbeat` | Agent status report (CPU, RAM, disk, online) |
-| A→S | `log_push` | Agent sends collected logs |
-| A→S | `pong` | Agent response to ping |
-| A→S | `registration` | Initial agent registration (before TLS) |
-| S→A | `ack` | Message acknowledgment |
-| S→A | `nack` | Message negative acknowledgment |
-
-### 5.3 Agent Registration Flow
+### Agent Communication Flow
 
 ```
-1. Agent generates RSA-2048 keypair locally (first run only)
-2. Agent sends POST /api/v1/agents/register:
-   {
-     "hostname": "server01.acme.com",
-     "os": "linux",
-     "os_version": "Ubuntu 22.04",
-     "agent_version": "1.0.0",
-     "public_key": "-----BEGIN PUBLIC KEY-----...",
-     "client_id": "acme-001",
-     "hardware_uuid": "..."
-   }
-3. Server validates client_id exists
-4. Server generates agent certificate signed by server CA
-5. Server stores agent record
-6. Server returns:
-   {
-     "agent_id": "agent-uuid-001",
-     "certificate": "-----BEGIN CERTIFICATE-----...",
-     "ca_certificate": "-----BEGIN CERTIFICATE-----...",
-     "server_ws_url": "wss://msp-server:8443/ws/agents/agent-uuid-001",
-     "heartbeat_interval": 60
-   }
-7. Agent stores certificate locally
-8. Agent connects to WebSocket using certificate
+Agent Start
+    │
+    ├── First run? ──Yes──→ POST /api/auth/agent-register → JWT
+    │                                              ↓
+    │                    Persist JWT to local config file
+    │
+    ▼
+WS Connect to /ws/agent/:token
+    │
+    ├── Server accepts → agent ready
+    │
+    ▼
+Heartbeat Loop (every 30s)
+    │
+    ├── Send: { type: "heartbeat", metrics: {...} }
+    ├── Recv: { type: "ack", pending_scripts: [...] }
+    │
+    ▼
+Script Execution (on demand)
+    │
+    ├── Recv: { type: "execute_script", script_id: "uuid", script: "..." }
+    ├── Execute locally (subprocess)
+    ├── Send: { type: "script_result", script_id: "uuid", exit_code: X, output: "..." }
+    │
+    ▼
+Auto-Update (on server push)
+    │
+    ├── Recv: { type: "update_push", version: "1.2.0", sha256: "..." }
+    ├── Download /ws/agent/binary?version=1.2.0
+    ├── Verify SHA-256
+    ├── Mark for restart on next idle window
 ```
 
-### 5.4 Heartbeat Specification
+### Agent Deployment
 
-- Interval: 60 seconds (configurable, min 30, max 300)
-- Payload:
-```json
-{
-  "type": "heartbeat",
-  "id": "hb-001",
-  "timestamp": "2024-01-15T10:30:00Z",
-  "payload": {
-    "status": "online",
-    "cpu_percent": 12.5,
-    "memory_percent": 34.2,
-    "disk_percent": 67.8,
-    "uptime_seconds": 864000,
-    "agent_version": "1.0.0",
-    "boot_time": "2024-01-08T00:00:00Z",
-    "interfaces": [
-      {"name": "eth0", "ip": "192.168.1.10", "mac": "aa:bb:cc:dd:ee:ff"}
-    ],
-    "check_status": {
-      "total": 5,
-      "ok": 4,
-      "warn": 1,
-      "crit": 0
-    }
-  }
-}
+The server exposes a download endpoint per platform:
+
 ```
-- Server marks agent offline if no heartbeat for 5 minutes (configurable)
-- Server generates `endpoint_offline` event after 3 missed heartbeats
+GET /api/agents/windows   → Windows x86_64 binary
+GET /api/agents/linux     → Linux x86_64 binary
+GET /api/agents/darwin    → macOS x86_64 binary
+```
+
+The binary is embedded in the server as a `map[string][]byte` using `go:embed`. The server sends the correct binary based on the requesting agent's reported OS.
+
+**Windows service registration:**
+- Agent writes itself to `C:\Program Files\MSP Tools Agent\msp-agent.exe`
+- Registers as a Windows Service via `sc.exe create`
+- Runs as `LocalSystem` (or a dedicated service account)
+
+**Linux/macOS service registration:**
+- Writes to `/usr/local/bin/msp-agent`
+- Creates systemd unit file (or launchd plist on macOS)
+- Enables and starts the service
+
+### Script Execution Sandbox
+
+- **Windows:** PowerShell run in Constrained Language Mode; execution policy restricted
+- **Linux/macOS:** Scripts run as the agent user (not root); explicit allowlist of dangerous commands not enforced (Go process limit would be needed for hard sandboxing)
+- All script output is captured and returned to the server
+- Execution timeout: 5 minutes (configurable per script invocation)
 
 ---
 
-## 6. WebSocket Architecture
+## Web UI Architecture (`web/`)
 
-### 6.1 WebSocket Endpoints
+### Stack
 
-| Endpoint | Purpose | Auth |
-|----------|---------|------|
-| `/ws/agents/{agent_id}` | Agent bidirectional channel | TLS client cert |
-| `/ws/ui` | Web UI real-time updates | JWT Bearer |
+- **React 18** with concurrent features
+- **TypeScript** (strict mode)
+- **Vite** (dev server + build)
+- **React Router v6** (SPA routing)
+- **TanStack Query v5** (server state management, caching, background refetch)
+- **Zustand** (lightweight client-side state: sidebar, theme, auth)
+- **Tailwind CSS** + **shadcn/ui** (styling + accessible components)
+- **WebSocket provider** (top-level React context, reconnects automatically)
 
-### 6.2 UI WebSocket Protocol
-
-```json
-// Client → Server (subscribe)
-{"type": "subscribe", "channels": ["alerts", "tickets", "endpoints"]}
-
-// Server → Client (push notification)
-{"type": "notification", "channel": "alerts", "data": {"id": 123, "title": "Disk full on server01", "severity": "critical"}}
-
-// Channels available:
-alerts     — New/modified alerts
-tickets    — Ticket changes (new, status change, comment)
-endpoints  — Endpoint online/offline/status changes
-checks     — Check results (optional, for real-time monitoring UI)
-```
-
-### 6.3 Connection Management
-
-- Max concurrent WebSocket connections: 1000 (configurable)
-- Per-user UI connections: 3 max
-- Heartbeat ping/pong every 30 seconds
-- Auto-reconnect with exponential backoff on client side
-- Connection stored in Redis-like dict for message broadcasting (in-process for single-server, Redis for multi-worker)
-
----
-
-## 7. Security Architecture
-
-### 7.1 Authentication Layers
+### Data Flow
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Request Flow                             │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  1. TLS Termination                                            │
-│     └── Server certificate (self-signed or Let's Encrypt)       │
-│                                                                 │
-│  2. API Key / JWT                                               │
-│     ├── Web UI: JWT Bearer token (15-min access + 7-day refresh)│
-│     ├── CLI: JWT Bearer token (same as API)                    │
-│     ├── Agents: TLS client certificate                         │
-│     └── Portal: Email + bcrypt password                        │
-│                                                                 │
-│  3. Authorization (RBAC)                                        │
-│     ├── admin: Full CRUD on all resources                      │
-│     ├── technician: CRUD on managed entities, read all         │
-│     ├── viewer: Read-only access                               │
-│     └── customer: Own tickets + KB articles                   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+User Action
+    │
+    ▼
+React Component → TanStack Query mutation or fetch
+    │
+    ▼
+API Request (HTTPS) → Server (REST API)
+    │
+    ▼
+Response → TanStack Query cache update → React re-render
 ```
 
-### 7.2 Password Security
-
-```python
-# Password hashing with bcrypt
-from passlib.context import CryptContext
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12)
-
-# Hash password
-hash = pwd_context.hash("user_password")
-
-# Verify password
-pwd_context.verify("user_password", hash)  # True/False
+For live data (metrics, alerts):
+```
+Server (WebSocket) → WebSocket Provider → React Context → Subscribing Components
 ```
 
-### 7.3 JWT Token Structure
+### API Client
 
-```json
-// Access Token Payload
-{
-  "sub": "1",                    // user_id
-  "username": "admin",
-  "role": "admin",
-  "type": "access",
-  "exp": 1705321800,             // Expiry timestamp
-  "iat": 1705320900              // Issued at
-}
+Generated TypeScript types from Go server structs (using `swagger` or `oapi-codegen`). All API calls go through a typed client:
 
-// Refresh Token Payload
-{
-  "sub": "1",
-  "type": "refresh",
-  "exp": 1705925700,             // 7 days
-  "iat": 1705320900
-}
-```
-
-### 7.4 Agent Certificate Chain
-
-```
-┌─────────────────────────────────────────┐
-│       Root CA (self-signed)             │
-│  CN=MSP Tools CA                        │
-│  Stored on server only                  │
-└─────────────────┬───────────────────────┘
-                  │ Signs
-                  ▼
-┌─────────────────────────────────────────┐
-│   Server Certificate                    │
-│  CN=msp-server.internal                 │
-│  Presented to agents + clients          │
-└─────────────────┬───────────────────────┘
-                  │ Signs (on agent registration)
-                  ▼
-┌─────────────────────────────────────────┐
-│   Agent Certificate                     │
-│  CN=agent-uuid-001                      │
-│  Each agent has unique cert             │
-│  Stored in agent config directory       │
-└─────────────────────────────────────────┘
-```
-
-### 7.5 Audit Logging Events
-
-| Event | Logged Details |
-|-------|---------------|
-| `login` | user_id, ip, user_agent, success/failure |
-| `logout` | user_id |
-| `client_create` | user_id, client_id, client_name |
-| `client_update` | user_id, client_id, changed_fields |
-| `client_delete` | user_id, client_id |
-| `endpoint_register` | agent_id, hostname, client_id |
-| `endpoint_offline` | agent_id, last_seen |
-| `ticket_create` | user_id, ticket_id, client_id |
-| `ticket_status_change` | user_id, ticket_id, old_status, new_status |
-| `ticket_assign` | user_id, ticket_id, assigned_to |
-| `invoice_create` | user_id, invoice_id, client_id, total |
-| `invoice_paid` | user_id, invoice_id, amount |
-| `runbook_execute` | user_id, runbook_id, endpoint_id |
-| `user_create` | admin_user_id, new_user_id, role |
-| `user_delete` | admin_user_id, deleted_user_id |
-
-### 7.6 Network Security
-
-- Server binds to localhost by default; expose via reverse proxy for remote agents
-- Agents connect outbound only (port 8443) — no inbound ports needed on endpoints
-- Firewall rules: allow 8443 outbound from agent network to server
-- Optional: VPN between agent network and server for additional isolation
-- All inter-service communication on localhost only
-
----
-
-## 8. Deployment Architecture
-
-### 8.1 Single-Server Deployment
-
-```
-┌─────────────────────────────────────────────────┐
-│              Ubuntu 22.04 LTS (VM)               │
-│                   2 vCPU, 4GB RAM                │
-│                                                 │
-│  ┌─────────────────────────────────────────────┐ │
-│  │ systemd: msp-server.service                 │ │
-│  │   └── uvicorn + FastAPI                     │ │
-│  │       - REST API: 0.0.0.0:8443             │ │
-│  │       - WebSocket: 0.0.0.0:8443 (ws)      │ │
-│  │       - Web UI: 0.0.0.0:8080 (optional)   │ │
-│  └─────────────────────────────────────────────┘ │
-│                                                 │
-│  ┌─────────────────────────────────────────────┐ │
-│  │ /opt/msp-tools/                             │ │
-│  │   ├── server/ (application code)           │ │
-│  │   ├── data/ (SQLite DB + uploads)           │ │
-│  │   ├── logs/ (application logs)              │ │
-│  │   └── config/ (YAML configs)               │ │
-│  └─────────────────────────────────────────────┘ │
-│                                                 │
-│  ┌─────────────────────────────────────────────┐ │
-│  │ Cron: Schedule reports, cleanup jobs        │ │
-│  └─────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────┘
-```
-
-### 8.2 Production Deployment (Multi-Worker)
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                    Load Balancer (nginx/haproxy)              │
-│                    TLS termination, port 443                  │
-└────────────────────────────┬─────────────────────────────────┘
-                             │
-        ┌────────────────────┼────────────────────┐
-        │                    │                    │
-        ▼                    ▼                    ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│  Worker 1     │    │  Worker 2     │    │  Worker 3     │
-│  uvicorn      │    │  uvicorn      │    │  uvicorn      │
-│  Gunicorn     │    │  Gunicorn     │    │  Gunicorn     │
-│  (prefork 4)  │    │  (prefork 4)  │    │  (prefork 4)  │
-└───────┬───────┘    └───────┬───────┘    └───────┬───────┘
-        │                    │                    │
-        └────────────────────┼────────────────────┘
-                             │
-                             ▼
-              ┌──────────────────────────────┐
-              │        Redis (or SQLite)       │
-              │   Shared state, WS sessions   │
-              └──────────────────────────────┘
-```
-
-### 8.3 Installation Steps
-
-```bash
-# 1. Clone / extract to /opt/msp-tools
-git clone https://github.com/your-repo/msp-tools.git /opt/msp-tools
-
-# 2. Create virtual environment
-python3 -m venv /opt/msp-tools/venv
-source /opt/msp-tools/venv/bin/activate
-pip install -r /opt/msp-tools/requirements.txt
-
-# 3. Initialize database
-python /opt/msp-tools/scripts/init-db.py
-
-# 4. Generate TLS certificates
-/opt/msp-tools/scripts/generate-certs.sh
-
-# 5. Configure
-cp /opt/msp-tools/config/defaults.yaml /opt/msp-tools/config/server.yaml
-# Edit server.yaml with your settings
-
-# 6. Create systemd service
-cp /opt/msp-tools/scripts/msp-server.service /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable msp-server
-systemctl start msp-server
-
-# 7. Install agents on endpoints
-# Run installer script on each endpoint (see Agent Installation section)
+```typescript
+const client = new ApiClient(baseUrl, token);
+const endpoints = await client.endpoints.list({ client_id: 42 });
 ```
 
 ---
 
-## 9. Directory Structure Detail
+## Security Architecture
 
-### 9.1 Server Module (`server/`)
+### TLS
 
-```
-server/
-├── __init__.py                    # Package init, exports main app
-├── main.py                        # FastAPI app creation, CORS, lifespan
-├── api/
-│   ├── __init__.py
-│   ├── deps.py                    # Dependency injection (get_db, get_current_user)
-│   ├── v1/
-│   │   ├── __init__.py            # APIRouter aggregation
-│   │   ├── auth.py               # /auth endpoints
-│   │   ├── clients.py            # /clients endpoints
-│   │   ├── endpoints.py          # /endpoints endpoints
-│   │   ├── monitoring.py        # /checks, /alerts
-│   │   ├── tickets.py           # /tickets, /ticket-comments
-│   │   ├── time_entries.py      # /time-entries
-│   │   ├── knowledge_base.py    # /kb
-│   │   ├── projects.py          # /projects, /project-tasks
-│   │   ├── contracts.py         # /contracts
-│   │   ├── invoices.py         # /invoices, /invoice-items
-│   │   ├── automation.py       # /runbooks, /events
-│   │   ├── reports.py          # /reports/*
-│   │   ├── agents.py           # /agents/*
-│   │   └── users.py            # /users/*
-│   └── errors.py               # Custom exception handlers
-├── db/
-│   ├── __init__.py
-│   ├── database.py             # create_engine, get_session, init_db
-│   ├── base.py                 # declarative_base
-│   └── migrations/            # Alembic migrations
-├── models/
-│   ├── __init__.py            # Re-export all models
-│   ├── user.py
-│   ├── client.py
-│   ├── endpoint.py
-│   ├── asset.py
-│   ├── check.py
-│   ├── alert.py
-│   ├── ticket.py
-│   ├── time_entry.py
-│   ├── kb_article.py
-│   ├── project.py
-│   ├── contract.py
-│   ├── invoice.py
-│   ├── runbook.py
-│   └── audit_log.py
-├── core/
-│   ├── __init__.py
-│   ├── config.py              # Settings class (from YAML + env)
-│   ├── security.py           # JWT, password, certificate utils
-│   ├── logging.py             # structlog setup
-│   └── events.py             # Internal event bus (simple pub/sub)
-├── ws/
-│   ├── __init__.py
-│   ├── manager.py            # WebSocket connection manager
-│   ├── agents.py             # Agent WS handler
-│   └── ui.py                 # UI WS handler (optional)
-├── services/
-│   ├── __init__.py
-│   ├── monitoring.py         # Check execution orchestration
-│   ├── alerting.py           # Alert creation, routing, email
-│   ├── ticketing.py          # Ticket business logic
-│   ├── billing.py            # Invoice generation logic
-│   ├── automation.py         # Runbook executor
-│   ├── health_score.py       # Health score calculation
-│   ├── agent_comm.py         # Agent push/pull management
-│   └── reports.py            # Report generation logic
-└── tasks/
-    ├── __init__.py
-    └── scheduler.py          # APScheduler job definitions
-```
+All production deployments require TLS. The server terminates TLS directly (no reverse proxy required, though one can be placed in front). Certificate rotation is manual (reload server to pick up new cert).
 
-### 9.2 Agent Module (`agents/`)
+### JWT Flow
 
 ```
-agents/
-├── common/
-│   ├── __init__.py
-│   ├── config.py             # AgentConfiguration dataclass
-│   ├── transport.py          # TLS/HTTP/WebSocket client
-│   ├── checks.py            # Built-in check implementations
-│   ├── crypto.py            # Certificate management
-│   └── installer.py         # Cross-platform installer logic
-├── linux/
-│   ├── __init__.py
-│   ├── agent.py             # Linux agent entry point
-│   ├── requirements.txt
-│   └── scripts/
-│       ├── check-disk.sh
-│       ├── check-memory.sh
-│       ├── check-cpu.sh
-│       ├── check-services.sh
-│       ├── check-uptime.sh
-│       └── check-load.sh
-├── windows/
-│   ├── __init__.py
-│   ├── agent.py             # Windows agent entry point
-│   ├── requirements.txt
-│   ├── service.py           # Windows Service wrapper
-│   └── scripts/
-│       ├── check-disk.ps1
-│       ├── check-memory.ps1
-│       ├── check-cpu.ps1
-│       └── check-services.ps1
-└── macos/
-    ├── __init__.py
-    ├── agent.py             # macOS agent entry point
-    └── requirements.txt
+Login:
+  POST /api/auth/login { username, password }
+    → Verify bcrypt hash
+    → Generate access token (1h) + refresh token (7d)
+    → Return both; store refresh token in httpOnly cookie
+
+Access Token Usage:
+  Authorization: Bearer <access_token>
+    → Middleware validates signature + expiry
+    → Inject user into Gin context
+
+Refresh:
+  POST /api/auth/refresh
+    → Validate refresh token (from cookie)
+    → Issue new access token
+    → Return new access token only
+
+Agent Token:
+  POST /api/auth/agent-register { registration_key, hostname, os }
+    → Verify global registration key
+    → Issue agent-specific JWT (30d, scoped to endpoint)
+    → Agent uses WS /ws/agent/:token (no Bearer header)
 ```
 
-### 9.3 Data Directory (`data/`)
+### Role-Based Access Control
 
-```
-data/
-├── msp.db                    # Main SQLite database
-├── msp.db-wal                # SQLite WAL file
-├── msp.db-shm               # SQLite shared memory
-├── backups/                 # Automatic DB backups
-│   ├── msp-2024-01-15.db
-│   └── msp-2024-01-14.db
-├── files/                   # Uploaded file storage
-│   ├── attachments/         # Ticket attachment files
-│   ├── agent-scripts/       # Custom agent scripts
-│   └── certs/              # Generated certificates
-├── reports/                 # Generated reports (CSV, PDF)
-│   ├── health-2024-01-15.pdf
-│   └── sla-2024-01.pdf
-└── agent-pkg/              # Agent installer packages
-    ├── linux-amd64.tar.gz
-    ├── windows-amd64.zip
-    └── macos-universal.tar.gz
+| Resource | admin | technician | viewer |
+|----------|-------|------------|--------|
+| Clients | CRUD | CRUD | Read |
+| Endpoints | CRUD | CRUD | Read |
+| Checks | CRUD | CRUD | Read |
+| Alerts | CRUD | Acknowledge | Read |
+| Tickets | CRUD | CRUD (assigned) | Read |
+| Time Entries | CRUD | CRUD (own) | Read |
+| Knowledge Base | CRUD | CRUD | Read |
+| Contracts | CRUD | Read | Read |
+| Invoices | CRUD | None | Read |
+| Reports | Full | Full | Read |
+| Users | CRUD | None | None |
+
+### Audit Log
+
+Every write operation (POST, PUT, DELETE) is logged asynchronously:
+
+```go
+// Logged fields:
+{ user_id, action, resource, resource_id, details (JSON), ip_address, created_at }
+// Example:
+{ 3, "DELETE", "endpoint", 17, `{"hostname": "server.acme.com"}`, "192.168.1.50", "2024-01-15T10:30:00Z" }
 ```
 
 ---
 
-## 10. Health Score Calculation
+## Deployment Topology
 
-### 10.1 Formula
+### Single-Server (SQLite)
 
 ```
-Client Health Score = 100 - (penalties)
+┌─────────────────────────────────┐
+│          Ubuntu/Debian          │
+│                                 │
+│  ┌───────────────────────────┐  │
+│  │  msp-tools server (Go)   │  │
+│  │  :8080 (HTTP)            │  │
+│  │  :8443 (HTTPS)           │  │
+│  └───────────────────────────┘  │
+│                                 │
+│  ┌───────────────────────────┐  │
+│  │  SQLite DB                │  │
+│  │  ./data/msp-tools.db      │  │
+│  └───────────────────────────┘  │
+│                                 │
+│  ┌───────────────────────────┐  │
+│  │  React SPA (served by Go)  │  │
+│  │  or nginx reverse proxy    │  │
+│  └───────────────────────────┘  │
+└─────────────────────────────────┘
 
-Penalties:
-  +10 per open CRITICAL alert
-  +5 per open HIGH alert
-  +2 per open MEDIUM alert
-  +1 per open LOW alert
-  +5 per open ticket > 7 days
-  +5 per SLA breach (response)
-  +10 per SLA breach (resolution)
-  +10 per offline endpoint
-  +5 per failed backup (last 24h)
-  +3 per endpoint with disk > 90%
-  +2 per endpoint with disk > 80%
+Agents ──WSS──► :8443
+Technicians ──HTTPS──► :8443
 ```
 
-### 10.2 Score Ranges
+Suitable for: up to ~500 endpoints, moderate check frequency.
 
-| Score | Status | Color |
-|-------|--------|-------|
-| 90-100 | Excellent | Green |
-| 70-89 | Good | Light Green |
-| 50-69 | Fair | Yellow |
-| 25-49 | Poor | Orange |
-| 0-24 | Critical | Red |
+### Multi-Server (PostgreSQL)
+
+```
+                        ┌──────────────┐
+                        │  PostgreSQL  │
+                        │  (primary)   │
+                        └──────┬───────┘
+                               │
+         ┌─────────────────────┼─────────────────────┐
+         │                     │                     │
+  ┌──────▼───────┐     ┌──────▼───────┐     ┌──────▼───────┐
+  │  Go Server   │     │  Go Server   │     │  Go Server   │
+  │  (US-East)   │     │  (EU-West)   │     │  (AP-South)  │
+  └──────────────┘     └──────────────┘     └──────────────┘
+
+  All servers: same PostgreSQL, agents distributed geographically.
+  TLS terminates at each server (or at load balancer in front).
+```
+
+Suitable for: thousands of endpoints, multiple office locations, high availability.
+
+### Behind a Reverse Proxy
+
+If placing Go server behind nginx/Caddy:
+
+```
+nginx/Caddy
+    │
+    ├── /api/*       → http://localhost:8080
+    ├── /ws/agent/*  → ws://localhost:8080 (with proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade)
+    └── /            → SPA static files (or separate nginx location for /web/dist)
+```
+
+Ensure `proxy_read_timeout 86400;` for long-lived WebSocket connections.
 
 ---
 
-## 11. Monitoring Check Reference
+## Performance Characteristics
 
-### 11.1 Check Types
+### Agent Connection Capacity
 
-| Type | Description | Thresholds |
-|------|-------------|-----------|
-| `disk` | Disk space usage % | warn: 80, crit: 90 |
-| `memory` | RAM usage % | warn: 80, crit: 90 |
-| `cpu` | CPU usage % | warn: 80, crit: 95 |
-| `load` | Load average vs CPU cores | warn: 0.75, crit: 1.0 |
-| `uptime` | Ping/port check | timeout: 5s, retries: 3 |
-| `ssl` | SSL certificate expiry | warn: 30 days, crit: 7 days |
-| `service` | Service running status | (list of service names) |
-| `process` | Process count/ram | (process name, warn/crit counts) |
-| `backup` | Backup file existence/freshness | max_age_hours: 25 |
-| `temperature` | Hardware temp (where available) | warn: 70°C, crit: 85°C |
-| `windows_update` | Pending updates count | warn: 10, crit: 30 |
-| `antivirus` | AV definition status | (days since update) |
+Each agent WebSocket connection consumes approximately:
+- **Memory:** ~50–100 KB (goroutine stack + WebSocket buffers)
+- **CPU:** Minimal when idle (just heartbeat ping/pong every 30s)
 
-### 11.2 Check Result Format
+A single server with 4 CPU cores can handle:
+- **5,000–10,000** concurrent agent connections
+- **500–1,000** concurrent technician WebSocket sessions (live dashboard)
+
+### Database Performance
+
+**SQLite:**
+- WAL mode allows concurrent readers; writes are serialised
+- Suitable for ≤500 endpoints with moderate check frequency (every 5 min)
+- Use `PRAGMA busy_timeout = 5000` to avoid "database locked" errors
+
+**PostgreSQL:**
+- Connection pool (default 25 connections, configurable up to 100)
+- Indexes on: `endpoints(client_id)`, `checks(endpoint_id, executed_at)`, `tickets(status, assigned_to)`
+- Metric retention: configurable (default 30 days for detailed, 1 year for hourly aggregates)
+
+### API Latency
+
+- p50: ~2–5ms (simple CRUD)
+- p99: ~20–50ms (report generation, complex queries)
+- WebSocket round-trip (script execution): depends on script duration
+
+---
+
+## Monitoring & Observability
+
+### Structured Logging
+
+All server logs are structured JSON (Zerolog or slog in Go 1.21+):
 
 ```json
 {
-  "check_id": 123,
-  "status": "WARN",
-  "value": 82.5,
-  "output": "Disk usage on / is 82.5% (78.2G / 94.9G used)",
-  "details": {
-    "mount_point": "/",
-    "total_gb": 94.9,
-    "used_gb": 78.2,
-    "free_gb": 16.7
-  },
-  "executed_at": "2024-01-15T10:30:00Z",
-  "execution_ms": 145
+  "level": "info",
+  "ts": "2024-01-15T10:30:00Z",
+  "request_id": "uuid",
+  "method": "GET",
+  "path": "/api/endpoints",
+  "status": 200,
+  "duration_ms": 4,
+  "user_id": 3,
+  "ip": "192.168.1.50"
 }
 ```
 
----
+### Metrics
 
-## 12. SLA Configuration
+Exposed at `/metrics` (Prometheus format):
+- HTTP request count/latency by route
+- WebSocket connection count (by type: agent, terminal)
+- Active agents online/offline
+- Check execution count by type and result
+- Alert count by severity
+- Database query latency
 
-### 12.1 SLA Tiers
+### Health Checks
 
-| Tier | Response Time | Resolution Time | Hours |
-|------|--------------|-----------------|-------|
-| Critical | 15 minutes | 4 hours | 24x7 |
-| High | 1 hour | 8 hours | Business |
-| Medium | 4 hours | 24 hours | Business |
-| Low | 8 hours | 72 hours | Business |
-
-### 12.2 Business Hours
-
-Configurable per-client:
-```yaml
-business_hours:
-  timezone: "America/New_York"
-  schedule:
-    - day: monday
-      start: "09:00"
-      end: "17:00"
-    - day: tuesday
-      start: "09:00"
-      end: "17:00"
-    # ... etc
+```
+GET /health           → 200 OK (server is up)
+GET /health/ready     → 200 OK if DB is reachable + agents can be contacted
+GET /health/live      → 200 OK (basic liveness, no DB check)
 ```
 
-SLA clock stops outside business hours unless 24x7 tier.
+Kubernetes probes: `/health/live` for liveness, `/health/ready` for readiness.
 
 ---
 
-*Document Version: 1.0*  
-*Last Updated: 2024-01-15*
+## Directory Structure
+
+```
+msp-tools/
+├── SPEC.md
+├── ARCHITECTURE.md              ← this file
+├── README.md
+│
+├── server/                      # Go API server
+│   ├── main.go                  # Entry point, graceful shutdown, signal handling
+│   ├── go.mod
+│   │
+│   ├── api/                    # HTTP handlers + routing
+│   │   ├── routes.go           # Route group registration
+│   │   ├── middleware/
+│   │   │   ├── requestid.go    # UUID injection
+│   │   │   ├── logger.go       # Structured request logging
+│   │   │   ├── recoverer.go    # Panic recovery
+│   │   │   ├── ratelimit.go    # Token bucket rate limiter
+│   │   │   ├── auth.go         # JWT validation
+│   │   │   ├── cors.go         # CORS headers
+│   │   │   └── rbac.go         # Role-based permission check
+│   │   ├── auth.go
+│   │   ├── clients.go
+│   │   ├── endpoints.go
+│   │   ├── monitoring.go
+│   │   ├── tickets.go
+│   │   ├── time.go
+│   │   ├── kb.go
+│   │   ├── contracts.go
+│   │   ├── billing.go
+│   │   ├── reports.go
+│   │   └── agents.go           # Binary download endpoints
+│   │
+│   ├── db/                     # Database layer
+│   │   ├── db.go               # SQLite / PostgreSQL connection
+│   │   ├── migrate.go          # Versioned migration runner
+│   │   ├── database.go         # Database interface definition
+│   │   ├── sqlite/
+│   │   │   ├── sqlite.go       # SQLite implementation
+│   │   │   ├── client.go
+│   │   │   ├── endpoint.go
+│   │   │   ├── ticket.go
+│   │   │   └── ...
+│   │   ├── postgres/
+│   │   │   ├── postgres.go      # PostgreSQL implementation
+│   │   │   ├── client.go
+│   │   │   └── ...
+│   │   └── migrations/
+│   │       ├── 001_initial.sql
+│   │       ├── 002_add_audit.sql
+│   │       └── ...
+│   │
+│   ├── services/              # Business logic (database-agnostic)
+│   │   ├── agent.go           # Agent registration, token management
+│   │   ├── monitoring.go      # Check scheduling, result aggregation
+│   │   ├── alerting.go       # Rule evaluation, notification dispatch
+│   │   ├── ticket.go         # Ticket lifecycle, SLA tracking
+│   │   ├── billing.go        # Invoice generation, payment tracking
+│   │   └── auth.go           # Login, token refresh, password hashing
+│   │
+│   ├── ws/                    # WebSocket layer
+│   │   ├── hub.go             # Connection hub (register/unregister/broadcast)
+│   │   ├── client.go          # Client struct + read/write goroutines
+│   │   ├── agent.go           # Agent message handlers (heartbeat, script result, etc.)
+│   │   ├── terminal.go        # Interactive shell terminal WS handler
+│   │   └── live.go            # Live data stream (metrics, alerts) WS handler
+│   │
+│   ├── embed/                 # Embedded agent binary (go:embed)
+│   │   └── agent_binaries.go  # Maps platform → binary bytes
+│   │
+│   └── config/
+│       ├── config.go          # YAML config loader
+│       └── config_test.go
+│
+├── agent/                      # Agent source (built separately)
+│   ├── main.go
+│   ├── client/
+│   │   └── ws.go             # WebSocket client with auto-reconnect
+│   ├── checks/
+│   │   ├── disk.go
+│   │   ├── ssl.go
+│   │   └── uptime.go
+│   ├── scripts/
+│   │   └── executor.go       # Script runner (PowerShell/Bash)
+│   ├── updater/
+│   │   └── updater.go        # Auto-update logic
+│   ├── service/
+│   │   └── service.go        # OS service registration
+│   └── README.md
+│
+├── web/                       # React SPA
+│   ├── package.json
+│   ├── vite.config.ts
+│   ├── index.html
+│   ├── tailwind.config.js
+│   ├── src/
+│   │   ├── main.tsx
+│   │   ├── App.tsx
+│   │   ├── api/              # Generated typed API client
+│   │   ├── components/       # Reusable UI components (shadcn)
+│   │   ├── pages/            # Route-level page components
+│   │   ├── hooks/            # Custom React hooks
+│   │   ├── lib/              # Utilities
+│   │   ├── store/            # Zustand stores
+│   │   └── types/            # TypeScript type definitions
+│   └── dist/                 # Built static assets (served by Go server)
+│
+├── cli/                       # Technician CLI (Go + Cobra)
+│   ├── main.go
+│   ├── cmd/
+│   │   ├── login.go
+│   │   ├── client.go
+│   │   ├── endpoint.go
+│   │   ├── ticket.go
+│   │   └── ...
+│   └── go.mod
+│
+├── monitoring/                 # Existing Python scripts (retained)
+│   ├── check-disk.py
+│   ├── check-ssl.py
+│   └── check-uptime.py
+│
+├── automation/                 # Runbook definitions (YAML)
+│   └── runbooks/
+│       ├── restart-service.yaml
+│       └── clear-temp.yaml
+│
+├── psa/                        # PSA module (Python, existing)
+│   ├── tickets/
+│   ├── time/
+│   ├── kb/
+│   ├── contracts/
+│   └── billing/
+│
+├── data/                       # Runtime data
+│   └── msp-tools.db           # SQLite database (gitignored)
+│
+├── logs/                       # Server logs (gitignored)
+│   └── .gitkeep
+│
+└── config/                     # Configuration (gitignored)
+    └── config.yaml.example
+```
+
+---
+
+## Design Decisions
+
+### Go over Python for Server/Agent
+
+- **Concurrency:** Go goroutines handle thousands of concurrent WebSocket connections with minimal memory. Python async (asyncio) works but requires more care to avoid blocking the event loop, and the ecosystem is less mature for this use case.
+- **Single binary deployment:** Go compiles to a static binary with no runtime. Python requires interpreter + dependencies on each endpoint.
+- **Cross-compilation:** Build Windows agent from Linux in one command (`GOOS=windows GOARCH=amd64 go build`). No CI VMs needed.
+- **Type safety:** Compile-time type checking catches entire classes of bugs that Python only catches at runtime.
+- **Performance:** Go handles JSON parsing/serialisation, TLS, and HTTP/WS with lower latency and less GC pressure than Python.
+
+### Gin over Standard `net/http`
+
+Gin provides a well-tuned HTTP router (3–5x faster than the standard library in benchmarks) and a middleware system that integrates cleanly with the Go ecosystem. The performance difference is rarely the bottleneck, but developer ergonomics (ctx-based request handling, binding/validation helpers) save significant time.
+
+### SQLite for Single-Server, PostgreSQL for Scale
+
+SQLite with WAL mode handles 500 concurrent endpoints well and requires zero administration. When the MSP outgrows a single server, migrate to PostgreSQL without changing application code (just swap the repository implementation and update the DSN).
+
+### WebSocket for Agent Communication
+
+Agents maintain a persistent WebSocket connection rather than polling HTTP. This gives:
+- Real-time script execution (no polling delay)
+- Lower server load (no thousands of polling requests/minute)
+- Immediate alert delivery to dashboards
+
+### HTMX vs React
+
+The spec originally planned HTMX + Go templates for a simpler, Node-free deployment. We chose React + Vite because:
+- React's component model scales better as the UI grows in complexity
+- TanStack Query provides a superior developer experience for data fetching/caching
+- A modern SPA is expected for an RMM product; HTMX would feel dated
+- Vite's dev experience is fast enough that the Node.js dependency is acceptable
+
+### JWT over Session Cookies for API
+
+JWTs are stateless and work cleanly across multiple API servers (PostgreSQL-backed sessions would require a shared session store). The tradeoff is that JWTs cannot be revoked before expiry — we mitigate this with short access token TTL (1h) and a refresh token rotation scheme.
+
+### No ORM
+
+Raw SQL via `database/sql` + `sqlx.Keep in mind this is what was decided:`. ORMs hide too much control (index usage, query plans, transaction boundaries). For a platform where DB performance directly impacts monitoring latency, explicit SQL is the right choice.
+
+### Agent Embedded in Server Binary
+
+The agent binary is embedded in the server binary using `go:embed` and served via a download endpoint. This means:
+- Single deployment artifact (one `msp-tools` binary contains server + all agent binaries)
+- No external file server needed
+- Version alignment enforced automatically (server version = agent version)
+
+The tradeoff: server binary is larger (~50–100 MB with all agent binaries included). Acceptable for a server deployment.
